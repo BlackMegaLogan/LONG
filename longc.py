@@ -696,12 +696,98 @@ INT_10 = b"\xCD\x10"
 JMP_LOOP = b"\xEB\xFE"
 
 
+def compiler_substitute_variables(text, compiler_vars):
+    """Replace <`VAR`> with values from compiler_vars."""
+    matches = re.findall(r"<`(.*?)`>", text)
+    for var in matches:
+        value = compiler_vars.get(var, f"<UNDEFINED:{var}>")
+        text = text.replace(f"<`{var}`>", value)
+    return text
+
+
+def compiler_parse_token_value(token, compiler_vars):
+    """Parse a token that may be quoted or contain <`VAR`> in compiler mode."""
+    if token is None:
+        return ""
+    token = token.strip()
+    if token.startswith('"') and token.endswith('"'):
+        return compiler_substitute_variables(token.strip('"'), compiler_vars)
+    token = compiler_substitute_variables(token, compiler_vars)
+    return compiler_vars.get(token, token)
+
+
+def compiler_eval_math(expr, compiler_vars):
+    """Evaluate Math(...) during compile-time using compiler variables."""
+    import ast
+
+    expr = expr.strip()
+    expr = compiler_substitute_variables(expr, compiler_vars)
+    if expr.startswith('"') and expr.endswith('"'):
+        expr = expr[1:-1]
+
+    allowed_nodes = (
+        ast.Expression,
+        ast.BinOp,
+        ast.UnaryOp,
+        ast.Constant,
+        ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow,
+        ast.UAdd, ast.USub,
+        ast.Load,
+    )
+
+    def _eval(node):
+        if not isinstance(node, allowed_nodes):
+            raise ValueError("Invalid math expression")
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float)):
+                return node.value
+            raise ValueError("Only numeric constants allowed")
+        if isinstance(node, ast.UnaryOp):
+            operand = _eval(node.operand)
+            if isinstance(node.op, ast.UAdd):
+                return +operand
+            if isinstance(node.op, ast.USub):
+                return -operand
+            raise ValueError("Invalid unary operator")
+        if isinstance(node, ast.BinOp):
+            left = _eval(node.left)
+            right = _eval(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.Div):
+                return left / right
+            if isinstance(node.op, ast.FloorDiv):
+                return left // right
+            if isinstance(node.op, ast.Mod):
+                return left % right
+            if isinstance(node.op, ast.Pow):
+                return left ** right
+            raise ValueError("Invalid binary operator")
+        raise ValueError("Invalid math expression")
+
+    tree = ast.parse(expr, mode="eval")
+    return _eval(tree)
+
+
 def extract_top_level_display_direct(lines):
-    """Return list of strings to print (in order) found as top-level DisplayText(DIRECT)="quoted" only.
-    Enforces quoting; raises on unquoted occurrences to align with interpreter.
+    """Return list of strings to print (in order) based on top-level statements.
+    Supports compile-time Set/If evaluation for DisplayText(DIRECT/SHELL).
+    Enforces quoted DisplayText values; raises on unquoted occurrences to align with interpreter.
     """
     out = []
     in_function = False
+    compiler_vars = {}
+    condition_stack = []
+
+    def is_active():
+        return all(condition_stack) if condition_stack else True
+
     for raw in lines:
         line = strip_inline_comment(raw.strip())
         if not line or line.startswith("//"):
@@ -715,15 +801,69 @@ def extract_top_level_display_direct(lines):
             continue
         if in_function:
             continue
-        # match DisplayText(DIRECT)="..." (require quotes)
-        m = re.match(r"DisplayText\(\s*DIRECT\s*\)\s*=\s*([\"'])(.*)\1\s*$", line, flags=re.IGNORECASE)
+
+        if line.startswith("If[") and "=" in line:
+            match = re.match(r"If\[(.*?)\]\s*=\s*[\"'](.*)[\"']\s*$", line)
+            if match:
+                left = match.group(1).strip()
+                right = match.group(2)
+            else:
+                match2 = re.match(r"If\[(.*?)\]\s*=\s*(\S+)\s*$", line)
+                if not match2:
+                    raise ValueError(f"Invalid If condition: '{line}'. Expected format: If[VAR]=\"value\"")
+                left = match2.group(1).strip()
+                right = match2.group(2)
+            left_val = compiler_vars.get(left, "").strip()
+            condition_stack.append(left_val == right)
+            continue
+
+        if line == "Else":
+            if not condition_stack:
+                raise ValueError("Else without matching If")
+            condition_stack[-1] = not condition_stack[-1]
+            continue
+
+        if line == "EndIf":
+            if not condition_stack:
+                raise ValueError("EndIf without matching If")
+            condition_stack.pop()
+            continue
+
+        if not is_active():
+            continue
+
+        if line.startswith("Set["):
+            match = re.match(r"Set\[(.*?)\]\s*=\s*(.*)", line)
+            if not match:
+                raise ValueError(f"Invalid Set syntax: {line}")
+            var_name = match.group(1)
+            raw_value = match.group(2).strip()
+            if raw_value.startswith("Math(") and raw_value.endswith(")"):
+                expr = raw_value[5:-1]
+                compiler_vars[var_name] = str(compiler_eval_math(expr, compiler_vars))
+                continue
+            if raw_value.startswith("ReadFile[") and raw_value.endswith("]"):
+                path_token = raw_value[len("ReadFile["):-1]
+                file_path = compiler_parse_token_value(path_token, compiler_vars)
+                with open(file_path, "r", encoding="utf-8") as f:
+                    compiler_vars[var_name] = f.read()
+                continue
+            if raw_value.startswith('"') and raw_value.endswith('"'):
+                compiler_vars[var_name] = compiler_substitute_variables(raw_value.strip('"'), compiler_vars)
+            else:
+                compiler_vars[var_name] = compiler_parse_token_value(raw_value, compiler_vars)
+            continue
+
+        # match DisplayText(DIRECT/SHELL)="..." (require quotes)
+        m = re.match(r"DisplayText\(\s*(DIRECT|SHELL)\s*\)\s*=\s*([\"'])(.*)\2\s*$", line, flags=re.IGNORECASE)
         if m:
-            val = m.group(2)
+            val = compiler_substitute_variables(m.group(3), compiler_vars)
             out.append(val)
         else:
-            # If the line starts like a DIRECT DisplayText but is not quoted, error out early
-            if re.match(r"DisplayText\(\s*DIRECT\s*\)\s*=\s*\S", line, flags=re.IGNORECASE):
-                raise ValueError(f"DisplayText(DIRECT) must be quoted: {line}")
+            if re.match(r"DisplayText\(\s*(DIRECT|SHELL)\s*\)\s*=\s*\S", line, flags=re.IGNORECASE):
+                raise ValueError(f"DisplayText must be quoted: {line}")
+    if condition_stack:
+        raise ValueError("Unclosed If block at end of file")
     return out
 
 
