@@ -1,7 +1,13 @@
 import re
 import sys
 import os
+import random
 import time
+import sys
+import select
+import termios
+import tty
+import atexit
 try:
     import msvcrt
 except ImportError:
@@ -17,10 +23,237 @@ program_lines = []
 current_line = 0
 current_fg = None
 current_bg = None
+fs_state = None
+repeat_ms = None
+last_input = ""
+last_raw_input = ""
+posix_raw_enabled = False
+posix_tty_state = None
+
+def ensure_posix_raw_mode():
+    global posix_raw_enabled, posix_tty_state
+    if posix_raw_enabled:
+        return True
+    if not sys.stdin.isatty():
+        return False
+    fd = sys.stdin.fileno()
+    posix_tty_state = termios.tcgetattr(fd)
+    tty.setraw(fd)
+    # Re-enable output post-processing so '\n' becomes CRLF and cursor stays aligned.
+    raw_attrs = termios.tcgetattr(fd)
+    raw_attrs[1] |= termios.OPOST | termios.ONLCR
+    termios.tcsetattr(fd, termios.TCSADRAIN, raw_attrs)
+    posix_raw_enabled = True
+    def _restore():
+        try:
+            if posix_tty_state is not None:
+                termios.tcsetattr(fd, termios.TCSADRAIN, posix_tty_state)
+        except Exception:
+            pass
+    atexit.register(_restore)
+    return True
 
 # ------------------------------
 # Utilities
 # ------------------------------
+
+def get_repo_root():
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+
+def fs_db_path():
+    return os.path.join(get_repo_root(), "build", "lush_fs.json")
+
+def fs_default_state():
+    return {
+        "block_size": 4096,
+        "next_block_id": 1,
+        "blocks": {},
+        "files": {},
+    }
+
+def fs_load():
+    global fs_state
+    if fs_state is not None:
+        return
+    path = fs_db_path()
+    if os.path.exists(path):
+        try:
+            import json
+            with open(path, "r", encoding="utf-8") as f:
+                fs_state = json.load(f)
+        except Exception:
+            fs_state = fs_default_state()
+    else:
+        fs_state = fs_default_state()
+
+def fs_save():
+    if fs_state is None:
+        return
+    try:
+        import json
+        build_dir = os.path.dirname(fs_db_path())
+        ensure_dir(build_dir)
+        with open(fs_db_path(), "w", encoding="utf-8") as f:
+            json.dump(fs_state, f, indent=2, sort_keys=True)
+    except Exception as e:
+        print(f"[ERROR] Failed to save FS state: {e}")
+
+def fs_normalize_path(path):
+    path = (path or "").strip()
+    if not path:
+        return "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    while "//" in path:
+        path = path.replace("//", "/")
+    return path
+
+def fs_parse_meta(meta_text):
+    meta = {}
+    if not meta_text:
+        return meta
+    text = meta_text.strip()
+    if text.startswith('"') and text.endswith('"'):
+        text = text[1:-1]
+    for token in re.split(r"[,\s]+", text.strip()):
+        if not token or "=" not in token:
+            continue
+        key, val = token.split("=", 1)
+        key = key.strip().lower()
+        val = val.strip()
+        if key in ("role", "ui", "run", "backup"):
+            meta[key] = val
+    return meta
+
+def fs_alloc_block():
+    fs_load()
+    block_id = fs_state["next_block_id"]
+    fs_state["next_block_id"] = block_id + 1
+    fs_state["blocks"][str(block_id)] = ""
+    return str(block_id)
+
+def fs_write_block(block_id, content):
+    fs_load()
+    block_id = str(block_id)
+    if block_id not in fs_state["blocks"]:
+        print(f"[ERROR] Block '{block_id}' not allocated.")
+        return False
+    block_size = int(fs_state.get("block_size", 4096))
+    fs_state["blocks"][block_id] = (content or "")[:block_size]
+    return True
+
+def fs_read_block(block_id):
+    fs_load()
+    block_id = str(block_id)
+    if block_id not in fs_state["blocks"]:
+        print(f"[ERROR] Block '{block_id}' not allocated.")
+        return ""
+    return fs_state["blocks"].get(block_id, "")
+
+def fs_get_file(path):
+    fs_load()
+    return fs_state["files"].get(path)
+
+def fs_create_file(path, meta=None):
+    fs_load()
+    now = time.time()
+    defaults = {
+        "role": "doc",
+        "ui": "none",
+        "run": "fg",
+        "backup": "versioned",
+    }
+    if meta:
+        defaults.update(meta)
+    fs_state["files"][path] = {
+        "blocks": [],
+        "size": 0,
+        "role": defaults["role"],
+        "ui": defaults["ui"],
+        "run": defaults["run"],
+        "backup": defaults["backup"],
+        "versions": [],
+        "created": now,
+        "modified": now,
+    }
+
+def fs_write_file(path, content):
+    fs_load()
+    file_entry = fs_get_file(path)
+    if file_entry is None:
+        fs_create_file(path)
+        file_entry = fs_get_file(path)
+    if file_entry["blocks"]:
+        file_entry["versions"].append({
+            "blocks": list(file_entry["blocks"]),
+            "size": file_entry["size"],
+            "ts": time.time(),
+        })
+    block_size = int(fs_state.get("block_size", 4096))
+    content = content or ""
+    blocks = []
+    if content:
+        for i in range(0, len(content), block_size):
+            chunk = content[i:i + block_size]
+            block_id = fs_alloc_block()
+            fs_write_block(block_id, chunk)
+            blocks.append(block_id)
+    file_entry["blocks"] = blocks
+    file_entry["size"] = len(content)
+    file_entry["modified"] = time.time()
+
+def fs_read_file(path):
+    fs_load()
+    file_entry = fs_get_file(path)
+    if file_entry is None:
+        print(f"[ERROR] File '{path}' not found.")
+        return ""
+    content = []
+    for block_id in file_entry.get("blocks", []):
+        content.append(fs_read_block(block_id))
+    return "".join(content)
+
+def fs_list_dir(path):
+    fs_load()
+    prefix = fs_normalize_path(path)
+    if not prefix.endswith("/"):
+        prefix += "/"
+    entries = set()
+    for file_path in fs_state["files"].keys():
+        if not file_path.startswith(prefix):
+            continue
+        remainder = file_path[len(prefix):]
+        if not remainder:
+            continue
+        if "/" in remainder:
+            entries.add(remainder.split("/", 1)[0] + "/")
+        else:
+            entries.add(remainder)
+    return sorted(entries)
+
+def fs_set_role(path, role):
+    fs_load()
+    file_entry = fs_get_file(path)
+    if file_entry is None:
+        print(f"[ERROR] File '{path}' not found.")
+        return False
+    file_entry["role"] = role
+    file_entry["modified"] = time.time()
+    return True
+
+def fs_tran(path):
+    fs_load()
+    file_entry = fs_get_file(path)
+    if file_entry is None:
+        print(f"[ERROR] File '{path}' not found.")
+        return False
+    file_entry["role"] = "Tran"
+    file_entry["run"] = "bg"
+    file_entry["modified"] = time.time()
+    return True
 
 def strip_inline_comment(line: str) -> str:
     """Remove inline comments (// or #) that occur outside quotes.
@@ -207,6 +440,26 @@ def tick_timer(ms):
         return
     time.sleep(delay)
 
+def tick_timer_seconds(seconds):
+    try:
+        delay = float(seconds)
+    except ValueError:
+        print("[ERROR] Time[SEC] requires a numeric second value")
+        return
+    if delay < 0:
+        return
+    time.sleep(delay)
+
+def tick_timer_minutes(minutes):
+    try:
+        delay = float(minutes) * 60.0
+    except ValueError:
+        print("[ERROR] Time[MIN] requires a numeric minute value")
+        return
+    if delay < 0:
+        return
+    time.sleep(delay)
+
 def draw_box(width, height, ch):
     try:
         w = int(width)
@@ -253,7 +506,9 @@ def send_to_hardware(text):
     This keeps real hardware access safe while giving a place to inspect DIRECT output.
     """
     try:
-        log_path = os.path.join(os.path.dirname(__file__), "hardware_output.log")
+        build_dir = os.path.join(get_repo_root(), "build")
+        ensure_dir(build_dir)
+        log_path = os.path.join(build_dir, "hardware_output.log")
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(text + "\n")
     except Exception as e:
@@ -291,6 +546,16 @@ def handle_set(line):
             print(f"[ERROR] Math evaluation failed: {e}")
         return
 
+    # Random choice: Set[VAR]=Random["a","b","c"]
+    if raw_value.startswith("Random[") and raw_value.endswith("]"):
+        inner = raw_value[len("Random["):-1].strip()
+        choices = re.findall(r"\"([^\"]*)\"", inner)
+        if not choices:
+            print("[ERROR] Random requires quoted string choices, e.g. Random[\"a\",\"b\"]")
+            return
+        variables[var_name] = random.choice(choices)
+        return
+
     # ReadFile: Set[VAR]=ReadFile["path"]
     if raw_value.startswith("ReadFile[") and raw_value.endswith("]"):
         path_token = raw_value[len("ReadFile["):-1]
@@ -300,6 +565,46 @@ def handle_set(line):
                 variables[var_name] = f.read()
         except Exception as e:
             print(f"[ERROR] ReadFile failed: {e}")
+        return
+
+    # FS[Read]: Set[VAR]=FS[Read]["path"]
+    fs_read_match = re.match(r"FS\[Read\]\[(.*?)\]\s*$", raw_value)
+    if fs_read_match:
+        file_path = fs_normalize_path(parse_path_token(fs_read_match.group(1)))
+        variables[var_name] = fs_read_file(file_path)
+        variables["LASTREADPATH"] = file_path
+        variables["LASTREAD"] = variables[var_name]
+        variables["LASTREADSIZE"] = str(len(variables[var_name]))
+        fs_save()
+        return
+
+    # FS[List]: Set[VAR]=FS[List]["path"]
+    fs_list_match = re.match(r"FS\[List\](?:\[(.*?)\])?\s*$", raw_value)
+    if fs_list_match:
+        list_path = fs_normalize_path(parse_path_token(fs_list_match.group(1)))
+        entries = fs_list_dir(list_path)
+        variables[var_name] = ",".join(entries)
+        variables["LASTLISTPATH"] = list_path
+        variables["LASTLIST"] = variables[var_name]
+        variables["LASTLISTCOUNT"] = str(len(entries))
+        fs_save()
+        return
+
+    # Block[Alloc]: Set[VAR]=Block[Alloc]
+    if re.match(r"Block\[Alloc\]\s*$", raw_value):
+        block_id = fs_alloc_block()
+        variables[var_name] = block_id
+        variables["LASTBLOCK"] = block_id
+        fs_save()
+        return
+
+    # Block[Read]: Set[VAR]=Block[Read][id]
+    block_read_match = re.match(r"Block\[Read\]\[(.*?)\]\s*$", raw_value)
+    if block_read_match:
+        block_id = parse_token_value(block_read_match.group(1))
+        variables[var_name] = fs_read_block(block_id)
+        variables["LASTBLOCK"] = str(block_id)
+        fs_save()
         return
 
     # Support DisplayText(TAG)=... where TAG can be DIRECT or SHELL (case-insensitive)
@@ -321,6 +626,28 @@ def handle_set(line):
             # Unknown tag: default to shell and warn
             print(f"[WARN] Unknown DisplayText tag '{tag}', defaulting to SHELL")
             display_to_shell(value)
+            variables[var_name] = value
+        return
+
+    # Support DisplayTextRaw(TAG)=... where TAG can be DIRECT or SHELL (case-insensitive)
+    dtr_match = re.match(r"DisplayTextRaw\((.*?)\)\s*=\s*([\"'])(.*)\2\s*$", raw_value)
+    if dtr_match:
+        tag = dtr_match.group(1).strip().upper()
+        value = dtr_match.group(3).strip()
+        value = substitute_variables(value)
+        if tag == "DIRECT":
+            send_to_hardware(value, add_newline=False)
+            variables[var_name] = value
+        elif tag == "SHELL":
+            prefix = ansi_prefix()
+            if prefix:
+                print(f"{prefix}{value}{ansi_reset()}", end="")
+            else:
+                print(value, end="")
+            variables[var_name] = value
+        else:
+            print(f"[WARN] Unknown DisplayTextRaw tag '{tag}', defaulting to SHELL")
+            print(value, end="")
             variables[var_name] = value
         return
 
@@ -351,58 +678,240 @@ def handle_display(line):
         print(f"[WARN] Unknown DisplayText tag '{tag}', defaulting to SHELL")
         display_to_shell(content)
 
+def handle_display_raw(line):
+    # line format: DisplayTextRaw(TAG)=<content>
+    match = re.match(r"DisplayTextRaw\((.*?)\)\s*=\s*([\"'])(.*)\2\s*$", line)
+    if not match:
+        print(f"[ERROR] Invalid DisplayTextRaw syntax (must be quoted): {line}")
+        return
+    tag = match.group(1).strip().upper()
+    content = match.group(3).strip()
+    content = substitute_variables(content)
+
+    if tag == "SHELL":
+        prefix = ansi_prefix()
+        if prefix:
+            print(f"{prefix}{content}{ansi_reset()}", end="")
+        else:
+            print(content, end="")
+    elif tag == "DIRECT":
+        send_to_hardware(content, add_newline=False)
+    else:
+        print(f"[WARN] Unknown DisplayTextRaw tag '{tag}', defaulting to SHELL")
+        print(content, end="")
+
+def handle_fs_command(line):
+    create_match = re.match(r"FS\[Create\]\[(.*?)\]\s*(?:=\s*(.*))?$", line)
+    if create_match:
+        file_path = fs_normalize_path(parse_path_token(create_match.group(1)))
+        meta_raw = parse_token_value(create_match.group(2)) if create_match.group(2) else ""
+        meta = fs_parse_meta(meta_raw)
+        if fs_get_file(file_path) is not None:
+            print(f"[ERROR] File '{file_path}' already exists.")
+            return
+        fs_create_file(file_path, meta)
+        variables["LASTCREATEPATH"] = file_path
+        fs_save()
+        return True
+
+    read_match = re.match(r"FS\[Read\]\[(.*?)\]\s*$", line)
+    if read_match:
+        file_path = fs_normalize_path(parse_path_token(read_match.group(1)))
+        content = fs_read_file(file_path)
+        variables["LASTREADPATH"] = file_path
+        variables["LASTREAD"] = content
+        variables["LASTREADSIZE"] = str(len(content))
+        fs_save()
+        return True
+
+    write_match = re.match(r"FS\[Write\]\[(.*?)\]\s*=\s*(.*)$", line)
+    if write_match:
+        file_path = fs_normalize_path(parse_path_token(write_match.group(1)))
+        content = parse_token_value(write_match.group(2))
+        fs_write_file(file_path, content)
+        variables["LASTWRITEPATH"] = file_path
+        variables["LASTWRITESIZE"] = str(len(content))
+        fs_save()
+        return True
+
+    list_match = re.match(r"FS\[List\](?:\[(.*?)\])?\s*$", line)
+    if list_match:
+        list_path = fs_normalize_path(parse_path_token(list_match.group(1)))
+        entries = fs_list_dir(list_path)
+        variables["LASTLISTPATH"] = list_path
+        variables["LASTLIST"] = ",".join(entries)
+        variables["LASTLISTCOUNT"] = str(len(entries))
+        fs_save()
+        return True
+
+    role_match = re.match(r"FS\[SetRole\]\[(.*?)\]\s*=\s*(.*)$", line)
+    if role_match:
+        file_path = fs_normalize_path(parse_path_token(role_match.group(1)))
+        role = parse_token_value(role_match.group(2))
+        if fs_set_role(file_path, role):
+            variables["LASTROLEPATH"] = file_path
+            variables["LASTROLE"] = role
+            fs_save()
+        return True
+
+    tran_match = re.match(r"FS\[Tran\]\[(.*?)\]\s*$", line)
+    if tran_match:
+        file_path = fs_normalize_path(parse_path_token(tran_match.group(1)))
+        if fs_tran(file_path):
+            variables["LASTROLEPATH"] = file_path
+            variables["LASTROLE"] = "Tran"
+            fs_save()
+        return True
+
+    return False
+
+def handle_block_command(line):
+    alloc_match = re.match(r"Block\[Alloc\]\s*$", line)
+    if alloc_match:
+        block_id = fs_alloc_block()
+        variables["LASTBLOCK"] = block_id
+        fs_save()
+        return True
+
+    read_match = re.match(r"Block\[Read\]\[(.*?)\]\s*$", line)
+    if read_match:
+        block_id = parse_token_value(read_match.group(1))
+        content = fs_read_block(block_id)
+        variables["LASTBLOCK"] = str(block_id)
+        variables["LASTBLOCKDATA"] = content
+        fs_save()
+        return True
+
+    write_match = re.match(r"Block\[Write\]\[(.*?)\]\s*=\s*(.*)$", line)
+    if write_match:
+        block_id = parse_token_value(write_match.group(1))
+        content = parse_token_value(write_match.group(2))
+        if fs_write_block(block_id, content):
+            variables["LASTBLOCK"] = str(block_id)
+            fs_save()
+        return True
+
+    return False
+
 def handle_input():
+    global last_input, last_raw_input
     user_input = input("> ").strip()
     variables["RAWINPUT"] = user_input
     normalized = normalize_input(user_input)
     variables["INPUT"] = normalized
     set_word_vars(normalized)
+    if normalized:
+        last_input = normalized
+        last_raw_input = user_input
     print(f"[DEBUG] INPUT received: '{user_input}'")  # You can remove this later
 
 def handle_input_instant():
     if msvcrt is None:
-        print("[ERROR] INSTANT input is only supported on Windows (msvcrt missing).")
-        return
-    ch = msvcrt.getwch()
+        # POSIX: read one char in raw mode
+        if not ensure_posix_raw_mode():
+            print("[ERROR] INSTANT input requires a TTY on this platform.")
+            return
+        ch = sys.stdin.read(1)
+    else:
+        ch = msvcrt.getwch()
     variables["RAWINPUT"] = ch
     normalized = normalize_input(ch)
     variables["INPUT"] = normalized
     set_word_vars(normalized)
+    if normalized:
+        global last_input, last_raw_input
+        last_input = normalized
+        last_raw_input = ch
 
 def handle_input_noblock():
+    global last_input, last_raw_input
+    ch = ""
     if msvcrt is None:
-        print("[ERROR] NOBLOCK input is only supported on Windows (msvcrt missing).")
-        return
-    if msvcrt.kbhit():
-        ch = msvcrt.getwch()
+        if not ensure_posix_raw_mode():
+            return
+        rlist, _, _ = select.select([sys.stdin], [], [], 0)
+        if rlist:
+            ch = sys.stdin.read(1)
+    else:
+        if msvcrt.kbhit():
+            ch = msvcrt.getwch()
+    if ch:
         variables["RAWINPUT"] = ch
         normalized = normalize_input(ch)
         variables["INPUT"] = normalized
         set_word_vars(normalized)
+        if normalized:
+            last_input = normalized
+            last_raw_input = ch
     else:
         variables["RAWINPUT"] = ""
         variables["INPUT"] = ""
         set_word_vars("")
 
+def handle_every(ms_value):
+    global repeat_ms, last_input, last_raw_input
+    try:
+        repeat_ms = int(ms_value)
+    except ValueError:
+        print("[ERROR] Every[MS] requires a numeric millisecond value")
+        return
+    if repeat_ms < 0:
+        return
+    time.sleep(repeat_ms / 1000.0)
+    # Repeat last input if nothing new was provided
+    if variables.get("INPUT", "") == "" and last_input:
+        variables["INPUT"] = last_input
+        variables["RAWINPUT"] = last_raw_input
+        set_word_vars(last_input)
+
+IF_OP_RE = re.compile(r"If\[(.*?)\]\s*(>=|<=|=|>|<)\s*(.+)$")
+
+def parse_uint_like_vm(value):
+    s = str(value).strip()
+    acc = 0
+    for ch in s:
+        if ch < '0' or ch > '9':
+            break
+        acc = acc * 10 + (ord(ch) - ord('0'))
+    return acc
+
+def parse_if_parts(line):
+    match = IF_OP_RE.match(line)
+    if not match:
+        return None
+    left = match.group(1).strip()
+    op = match.group(2)
+    right_raw = match.group(3).strip()
+    if (right_raw.startswith('"') and right_raw.endswith('"')) or (right_raw.startswith("'") and right_raw.endswith("'")):
+        right = substitute_variables(right_raw[1:-1])
+        right_is_var = False
+    else:
+        right = right_raw
+        right_is_var = right in variables
+    return left, op, right, right_is_var
+
 def handle_if(line):
     try:
-        # Prefer quoted RHS: If[VAR]="value" or If[VAR]='value'
-        match = re.match(r"If\[(.*?)\]\s*=\s*[\"'](.*)[\"']\s*$", line)
-        if match:
-            left = match.group(1).strip()
-            right = match.group(2)
-        else:
-            # Backwards-compatible: accept unquoted RHS like If[VAR]=value (warn)
-            match2 = re.match(r"If\[(.*?)\]\s*=\s*(\S+)\s*$", line)
-            if not match2:
-                print(f"[ERROR] Invalid If condition: '{line}'. Expected format: If[VAR]=\"value\"")
-                return False
-            left = match2.group(1).strip()
-            right = match2.group(2)
-            print(f"[WARN] If RHS not quoted: treating '{right}' as string")
-
+        parsed = parse_if_parts(line)
+        if not parsed:
+            print(f"[ERROR] Invalid If condition: '{line}'. Expected format: If[VAR] OP VALUE")
+            return False
+        left, op, right, right_is_var = parsed
         left_val = variables.get(left, "").strip()
-        return left_val == right
+        right_val = variables.get(right, "").strip() if right_is_var else right
+
+        if op == "=":
+            return left_val == right_val
+        if op == "<":
+            return parse_uint_like_vm(left_val) < parse_uint_like_vm(right_val)
+        if op == "<=":
+            return parse_uint_like_vm(left_val) <= parse_uint_like_vm(right_val)
+        if op == ">":
+            return parse_uint_like_vm(left_val) > parse_uint_like_vm(right_val)
+        if op == ">=":
+            return parse_uint_like_vm(left_val) >= parse_uint_like_vm(right_val)
+        print(f"[ERROR] Unsupported If operator: '{op}'")
+        return False
 
     except Exception as e:
         print(f"[ERROR] Failed to parse If condition: {e}")
@@ -417,7 +926,7 @@ def skip_if_block(start_index):
     i = start_index + 1
     while i < len(program_lines):
         l = program_lines[i].strip()
-        if l.startswith("If[") and "=" in l:
+        if IF_OP_RE.match(l):
             depth += 1
         elif l == "EndIf":
             if depth == 0:
@@ -434,7 +943,7 @@ def skip_to_endif(start_index):
     i = start_index + 1
     while i < len(program_lines):
         l = program_lines[i].strip()
-        if l.startswith("If[") and "=" in l:
+        if IF_OP_RE.match(l):
             depth += 1
         elif l == "EndIf":
             if depth == 0:
@@ -465,11 +974,24 @@ def handle_goto(label):
         sys.exit(1)
 
 def handle_call(func_name):
+    global program_lines, current_line
     if func_name not in functions:
         print(f"[ERROR] Function '{func_name}' not found.")
         return
-    for line in functions[func_name]:
-        execute_line(line)
+    # Execute function body in its own line context so If/Else skips don't
+    # mutate the main program flow.
+    saved_program_lines = program_lines
+    saved_current_line = current_line
+    try:
+        program_lines = functions[func_name]
+        current_line = 0
+        while current_line < len(program_lines):
+            line = program_lines[current_line].strip()
+            execute_line(line)
+            current_line += 1
+    finally:
+        program_lines = saved_program_lines
+        current_line = saved_current_line
 
 # ------------------------------
 # Interpreter
@@ -493,6 +1015,17 @@ def execute_line(line):
 
     elif line.startswith("DisplayText(DIRECT)=") or line.startswith("DisplayText(SHELL)="):
         handle_display(line)
+
+    elif line.startswith("DisplayTextRaw(DIRECT)=") or line.startswith("DisplayTextRaw(SHELL)="):
+        handle_display_raw(line)
+
+    elif line.startswith("FS["):
+        if handle_fs_command(line):
+            return
+
+    elif line.startswith("Block["):
+        if handle_block_command(line):
+            return
 
     elif line.startswith("WriteFile"):
         match = re.match(r"WriteFile(?:\[(.*?)\])?\s*(?:=\s*(.*))?$", line)
@@ -534,8 +1067,15 @@ def execute_line(line):
             handle_input_noblock()
         else:
             handle_input()
+    elif line.startswith("Every[MS]"):
+        match = re.match(r"Every\[MS\]\s*=\s*(.*)$", line)
+        if not match:
+            print(f"[ERROR] Invalid Every syntax: {line}")
+            return
+        ms = parse_token_value(match.group(1))
+        handle_every(ms)
 
-    elif line.startswith("If[") and "=" in line:
+    elif IF_OP_RE.match(line):
         if not handle_if(line):
             current_line = skip_if_block(current_line)
             # If we landed on Else/EndIf, skip its line too.
@@ -588,6 +1128,41 @@ def execute_line(line):
     elif line == "ClearScreen":
         clear_screen()
 
+    elif line == "FillLine":
+        try:
+            import shutil
+            cols = shutil.get_terminal_size((80, 20)).columns
+        except Exception:
+            cols = 80
+        text = " " * max(1, cols)
+        print(f"{ansi_prefix()}{text}{ansi_reset()}", end="")
+        print("\r", end="")
+
+    elif line.startswith("FillLines[") and line.endswith("]"):
+        try:
+            raw_count = line.split("FillLines[", 1)[1][:-1]
+            count = int(parse_token_value(raw_count))
+        except Exception:
+            print(f"[ERROR] Invalid FillLines syntax: {line}")
+            return
+        if count <= 0:
+            return
+        try:
+            import shutil
+            cols = shutil.get_terminal_size((80, 20)).columns
+        except Exception:
+            cols = 80
+        text = " " * max(1, cols)
+        prefix = ansi_prefix()
+        for i in range(count):
+            if prefix:
+                print(f"{prefix}{text}{ansi_reset()}", end="")
+            else:
+                print(text, end="")
+            if i < count - 1:
+                print()
+        print("\r", end="")
+
     elif line.startswith("SetCursor["):
         match = re.match(r"SetCursor\[(.*?)\s*,\s*(.*?)\]\s*$", line)
         if not match:
@@ -607,6 +1182,20 @@ def execute_line(line):
             return
         ms = parse_token_value(match.group(1))
         tick_timer(ms)
+
+    elif line.startswith("Time["):
+        match = re.match(r"Time\[(MS|SEC|MIN)\]\s*=\s*(.*)$", line, re.IGNORECASE)
+        if not match:
+            print(f"[ERROR] Invalid Time syntax: {line}")
+            return
+        unit = match.group(1).upper()
+        value = parse_token_value(match.group(2))
+        if unit == "MS":
+            tick_timer(value)
+        elif unit == "SEC":
+            tick_timer_seconds(value)
+        elif unit == "MIN":
+            tick_timer_minutes(value)
 
     elif line.startswith("StartFunction[") or line == "EndFunction":
         return  # Already handled in preload
