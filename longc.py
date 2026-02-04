@@ -17,10 +17,209 @@ program_lines = []
 current_line = 0
 current_fg = None
 current_bg = None
+fs_state = None
 
 # ------------------------------
 # Utilities
 # ------------------------------
+
+def get_repo_root():
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+
+def fs_db_path():
+    return os.path.join(get_repo_root(), "build", "lush_fs.json")
+
+def fs_default_state():
+    return {
+        "block_size": 4096,
+        "next_block_id": 1,
+        "blocks": {},
+        "files": {},
+    }
+
+def fs_load():
+    global fs_state
+    if fs_state is not None:
+        return
+    path = fs_db_path()
+    if os.path.exists(path):
+        try:
+            import json
+            with open(path, "r", encoding="utf-8") as f:
+                fs_state = json.load(f)
+        except Exception:
+            fs_state = fs_default_state()
+    else:
+        fs_state = fs_default_state()
+
+def fs_save():
+    if fs_state is None:
+        return
+    try:
+        import json
+        build_dir = os.path.dirname(fs_db_path())
+        ensure_dir(build_dir)
+        with open(fs_db_path(), "w", encoding="utf-8") as f:
+            json.dump(fs_state, f, indent=2, sort_keys=True)
+    except Exception as e:
+        print(f"[ERROR] Failed to save FS state: {e}")
+
+def fs_normalize_path(path):
+    path = (path or "").strip()
+    if not path:
+        return "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    while "//" in path:
+        path = path.replace("//", "/")
+    return path
+
+def fs_parse_meta(meta_text):
+    meta = {}
+    if not meta_text:
+        return meta
+    text = meta_text.strip()
+    if text.startswith('"') and text.endswith('"'):
+        text = text[1:-1]
+    for token in re.split(r"[,\s]+", text.strip()):
+        if not token or "=" not in token:
+            continue
+        key, val = token.split("=", 1)
+        key = key.strip().lower()
+        val = val.strip()
+        if key in ("role", "ui", "run", "backup"):
+            meta[key] = val
+    return meta
+
+def fs_alloc_block():
+    fs_load()
+    block_id = fs_state["next_block_id"]
+    fs_state["next_block_id"] = block_id + 1
+    fs_state["blocks"][str(block_id)] = ""
+    return str(block_id)
+
+def fs_write_block(block_id, content):
+    fs_load()
+    block_id = str(block_id)
+    if block_id not in fs_state["blocks"]:
+        print(f"[ERROR] Block '{block_id}' not allocated.")
+        return False
+    block_size = int(fs_state.get("block_size", 4096))
+    fs_state["blocks"][block_id] = (content or "")[:block_size]
+    return True
+
+def fs_read_block(block_id):
+    fs_load()
+    block_id = str(block_id)
+    if block_id not in fs_state["blocks"]:
+        print(f"[ERROR] Block '{block_id}' not allocated.")
+        return ""
+    return fs_state["blocks"].get(block_id, "")
+
+def fs_get_file(path):
+    fs_load()
+    return fs_state["files"].get(path)
+
+def fs_create_file(path, meta=None):
+    fs_load()
+    now = time.time()
+    defaults = {
+        "role": "doc",
+        "ui": "none",
+        "run": "fg",
+        "backup": "versioned",
+    }
+    if meta:
+        defaults.update(meta)
+    fs_state["files"][path] = {
+        "blocks": [],
+        "size": 0,
+        "role": defaults["role"],
+        "ui": defaults["ui"],
+        "run": defaults["run"],
+        "backup": defaults["backup"],
+        "versions": [],
+        "created": now,
+        "modified": now,
+    }
+
+def fs_write_file(path, content):
+    fs_load()
+    file_entry = fs_get_file(path)
+    if file_entry is None:
+        fs_create_file(path)
+        file_entry = fs_get_file(path)
+    if file_entry["blocks"]:
+        file_entry["versions"].append({
+            "blocks": list(file_entry["blocks"]),
+            "size": file_entry["size"],
+            "ts": time.time(),
+        })
+    block_size = int(fs_state.get("block_size", 4096))
+    content = content or ""
+    blocks = []
+    if content:
+        for i in range(0, len(content), block_size):
+            chunk = content[i:i + block_size]
+            block_id = fs_alloc_block()
+            fs_write_block(block_id, chunk)
+            blocks.append(block_id)
+    file_entry["blocks"] = blocks
+    file_entry["size"] = len(content)
+    file_entry["modified"] = time.time()
+
+def fs_read_file(path):
+    fs_load()
+    file_entry = fs_get_file(path)
+    if file_entry is None:
+        print(f"[ERROR] File '{path}' not found.")
+        return ""
+    content = []
+    for block_id in file_entry.get("blocks", []):
+        content.append(fs_read_block(block_id))
+    return "".join(content)
+
+def fs_list_dir(path):
+    fs_load()
+    prefix = fs_normalize_path(path)
+    if not prefix.endswith("/"):
+        prefix += "/"
+    entries = set()
+    for file_path in fs_state["files"].keys():
+        if not file_path.startswith(prefix):
+            continue
+        remainder = file_path[len(prefix):]
+        if not remainder:
+            continue
+        if "/" in remainder:
+            entries.add(remainder.split("/", 1)[0] + "/")
+        else:
+            entries.add(remainder)
+    return sorted(entries)
+
+def fs_set_role(path, role):
+    fs_load()
+    file_entry = fs_get_file(path)
+    if file_entry is None:
+        print(f"[ERROR] File '{path}' not found.")
+        return False
+    file_entry["role"] = role
+    file_entry["modified"] = time.time()
+    return True
+
+def fs_tran(path):
+    fs_load()
+    file_entry = fs_get_file(path)
+    if file_entry is None:
+        print(f"[ERROR] File '{path}' not found.")
+        return False
+    file_entry["role"] = "Tran"
+    file_entry["run"] = "bg"
+    file_entry["modified"] = time.time()
+    return True
 
 def strip_inline_comment(line: str) -> str:
     """Remove inline comments (// or #) that occur outside quotes.
@@ -204,6 +403,26 @@ def tick_timer(ms):
         return
     time.sleep(delay)
 
+def tick_timer_seconds(seconds):
+    try:
+        delay = float(seconds)
+    except ValueError:
+        print("[ERROR] Time[SEC] requires a numeric second value")
+        return
+    if delay < 0:
+        return
+    time.sleep(delay)
+
+def tick_timer_minutes(minutes):
+    try:
+        delay = float(minutes) * 60.0
+    except ValueError:
+        print("[ERROR] Time[MIN] requires a numeric minute value")
+        return
+    if delay < 0:
+        return
+    time.sleep(delay)
+
 def draw_box(width, height, ch):
     try:
         w = int(width)
@@ -245,14 +464,19 @@ def set_word_vars(text):
     variables["WORD2"] = words[1] if len(words) > 1 else ""
     variables["WORD3"] = words[2] if len(words) > 2 else ""
 
-def send_to_hardware(text):
+def send_to_hardware(text, add_newline=True):
     """Simulate writing to hardware by appending to a hardware_output.log file next to the script.
     This keeps real hardware access safe while giving a place to inspect DIRECT output.
     """
     try:
-        log_path = os.path.join(os.path.dirname(__file__), "hardware_output.log")
+        build_dir = os.path.join(get_repo_root(), "build")
+        ensure_dir(build_dir)
+        log_path = os.path.join(build_dir, "hardware_output.log")
         with open(log_path, "a", encoding="utf-8") as f:
-            f.write(text + "\n")
+            if add_newline:
+                f.write(text + "\n")
+            else:
+                f.write(text)
     except Exception as e:
         print(f"[ERROR] Failed to write to hardware log: {e}")
 
@@ -299,6 +523,46 @@ def handle_set(line):
             print(f"[ERROR] ReadFile failed: {e}")
         return
 
+    # FS[Read]: Set[VAR]=FS[Read]["path"]
+    fs_read_match = re.match(r"FS\[Read\]\[(.*?)\]\s*$", raw_value)
+    if fs_read_match:
+        file_path = fs_normalize_path(parse_path_token(fs_read_match.group(1)))
+        variables[var_name] = fs_read_file(file_path)
+        variables["LASTREADPATH"] = file_path
+        variables["LASTREAD"] = variables[var_name]
+        variables["LASTREADSIZE"] = str(len(variables[var_name]))
+        fs_save()
+        return
+
+    # FS[List]: Set[VAR]=FS[List]["path"]
+    fs_list_match = re.match(r"FS\[List\](?:\[(.*?)\])?\s*$", raw_value)
+    if fs_list_match:
+        list_path = fs_normalize_path(parse_path_token(fs_list_match.group(1)))
+        entries = fs_list_dir(list_path)
+        variables[var_name] = ",".join(entries)
+        variables["LASTLISTPATH"] = list_path
+        variables["LASTLIST"] = variables[var_name]
+        variables["LASTLISTCOUNT"] = str(len(entries))
+        fs_save()
+        return
+
+    # Block[Alloc]: Set[VAR]=Block[Alloc]
+    if re.match(r"Block\[Alloc\]\s*$", raw_value):
+        block_id = fs_alloc_block()
+        variables[var_name] = block_id
+        variables["LASTBLOCK"] = block_id
+        fs_save()
+        return
+
+    # Block[Read]: Set[VAR]=Block[Read][id]
+    block_read_match = re.match(r"Block\[Read\]\[(.*?)\]\s*$", raw_value)
+    if block_read_match:
+        block_id = parse_token_value(block_read_match.group(1))
+        variables[var_name] = fs_read_block(block_id)
+        variables["LASTBLOCK"] = str(block_id)
+        fs_save()
+        return
+
     # Support DisplayText(TAG)=... where TAG can be DIRECT or SHELL (case-insensitive)
     dt_match = re.match(r"DisplayText\((.*?)\)\s*=\s*([\"'])(.*)\2\s*$", raw_value)
     if dt_match:
@@ -318,6 +582,28 @@ def handle_set(line):
             # Unknown tag: default to shell and warn
             print(f"[WARN] Unknown DisplayText tag '{tag}', defaulting to SHELL")
             display_to_shell(value)
+            variables[var_name] = value
+        return
+
+    # Support DisplayTextRaw(TAG)=... where TAG can be DIRECT or SHELL (case-insensitive)
+    dtr_match = re.match(r"DisplayTextRaw\((.*?)\)\s*=\s*([\"'])(.*)\2\s*$", raw_value)
+    if dtr_match:
+        tag = dtr_match.group(1).strip().upper()
+        value = dtr_match.group(3).strip()
+        value = substitute_variables(value)
+        if tag == "DIRECT":
+            send_to_hardware(value, add_newline=False)
+            variables[var_name] = value
+        elif tag == "SHELL":
+            prefix = ansi_prefix()
+            if prefix:
+                print(f"{prefix}{value}{ansi_reset()}", end="")
+            else:
+                print(value, end="")
+            variables[var_name] = value
+        else:
+            print(f"[WARN] Unknown DisplayTextRaw tag '{tag}', defaulting to SHELL")
+            print(value, end="")
             variables[var_name] = value
         return
 
@@ -343,10 +629,125 @@ def handle_display(line):
         display_to_shell(content)
     elif tag == "DIRECT":
         # Do not print to shell; write to simulated hardware
-        send_to_hardware(content)
+        send_to_hardware(content, add_newline=True)
     else:
         print(f"[WARN] Unknown DisplayText tag '{tag}', defaulting to SHELL")
         display_to_shell(content)
+
+def handle_display_raw(line):
+    # line format: DisplayTextRaw(TAG)=<content>
+    match = re.match(r"DisplayTextRaw\((.*?)\)\s*=\s*([\"'])(.*)\2\s*$", line)
+    if not match:
+        print(f"[ERROR] Invalid DisplayTextRaw syntax (must be quoted): {line}")
+        return
+    tag = match.group(1).strip().upper()
+    content = match.group(3).strip()
+    content = substitute_variables(content)
+
+    if tag == "SHELL":
+        prefix = ansi_prefix()
+        if prefix:
+            print(f"{prefix}{content}{ansi_reset()}", end="")
+        else:
+            print(content, end="")
+    elif tag == "DIRECT":
+        send_to_hardware(content, add_newline=False)
+    else:
+        print(f"[WARN] Unknown DisplayTextRaw tag '{tag}', defaulting to SHELL")
+        print(content, end="")
+
+def handle_fs_command(line):
+    create_match = re.match(r"FS\[Create\]\[(.*?)\]\s*(?:=\s*(.*))?$", line)
+    if create_match:
+        file_path = fs_normalize_path(parse_path_token(create_match.group(1)))
+        meta_raw = parse_token_value(create_match.group(2)) if create_match.group(2) else ""
+        meta = fs_parse_meta(meta_raw)
+        if fs_get_file(file_path) is not None:
+            print(f"[ERROR] File '{file_path}' already exists.")
+            return True
+        fs_create_file(file_path, meta)
+        variables["LASTCREATEPATH"] = file_path
+        fs_save()
+        return True
+
+    read_match = re.match(r"FS\[Read\]\[(.*?)\]\s*$", line)
+    if read_match:
+        file_path = fs_normalize_path(parse_path_token(read_match.group(1)))
+        content = fs_read_file(file_path)
+        variables["LASTREADPATH"] = file_path
+        variables["LASTREAD"] = content
+        variables["LASTREADSIZE"] = str(len(content))
+        fs_save()
+        return True
+
+    write_match = re.match(r"FS\[Write\]\[(.*?)\]\s*=\s*(.*)$", line)
+    if write_match:
+        file_path = fs_normalize_path(parse_path_token(write_match.group(1)))
+        content = parse_token_value(write_match.group(2))
+        fs_write_file(file_path, content)
+        variables["LASTWRITEPATH"] = file_path
+        variables["LASTWRITESIZE"] = str(len(content))
+        fs_save()
+        return True
+
+    list_match = re.match(r"FS\[List\](?:\[(.*?)\])?\s*$", line)
+    if list_match:
+        list_path = fs_normalize_path(parse_path_token(list_match.group(1)))
+        entries = fs_list_dir(list_path)
+        variables["LASTLISTPATH"] = list_path
+        variables["LASTLIST"] = ",".join(entries)
+        variables["LASTLISTCOUNT"] = str(len(entries))
+        fs_save()
+        return True
+
+    role_match = re.match(r"FS\[SetRole\]\[(.*?)\]\s*=\s*(.*)$", line)
+    if role_match:
+        file_path = fs_normalize_path(parse_path_token(role_match.group(1)))
+        role = parse_token_value(role_match.group(2))
+        if fs_set_role(file_path, role):
+            variables["LASTROLEPATH"] = file_path
+            variables["LASTROLE"] = role
+            fs_save()
+        return True
+
+    tran_match = re.match(r"FS\[Tran\]\[(.*?)\]\s*$", line)
+    if tran_match:
+        file_path = fs_normalize_path(parse_path_token(tran_match.group(1)))
+        if fs_tran(file_path):
+            variables["LASTROLEPATH"] = file_path
+            variables["LASTROLE"] = "Tran"
+            fs_save()
+        return True
+
+    return False
+
+def handle_block_command(line):
+    alloc_match = re.match(r"Block\[Alloc\]\s*$", line)
+    if alloc_match:
+        block_id = fs_alloc_block()
+        variables["LASTBLOCK"] = block_id
+        fs_save()
+        return True
+
+    read_match = re.match(r"Block\[Read\]\[(.*?)\]\s*$", line)
+    if read_match:
+        block_id = parse_token_value(read_match.group(1))
+        content = fs_read_block(block_id)
+        variables["LASTBLOCK"] = str(block_id)
+        variables["LASTBLOCKDATA"] = content
+        fs_save()
+        return True
+
+    write_match = re.match(r"Block\[Write\]\[(.*?)\]\s*=\s*(.*)$", line)
+    if write_match:
+        block_id = parse_token_value(write_match.group(1))
+        content = parse_token_value(write_match.group(2))
+        if fs_write_block(block_id, content):
+            variables["LASTBLOCK"] = str(block_id)
+            fs_save()
+        return True
+
+    return False
 
 def handle_input():
     user_input = input("> ").strip()
@@ -381,25 +782,54 @@ def handle_input_noblock():
         variables["INPUT"] = ""
         set_word_vars("")
 
+IF_OP_RE = re.compile(r"If\[(.*?)\]\s*(>=|<=|=|>|<)\s*(.+)$")
+
+def parse_uint_like_vm(value):
+    s = str(value).strip()
+    acc = 0
+    for ch in s:
+        if ch < '0' or ch > '9':
+            break
+        acc = acc * 10 + (ord(ch) - ord('0'))
+    return acc
+
+def parse_if_parts(line):
+    match = IF_OP_RE.match(line)
+    if not match:
+        return None
+    left = match.group(1).strip()
+    op = match.group(2)
+    right_raw = match.group(3).strip()
+    if (right_raw.startswith('"') and right_raw.endswith('"')) or (right_raw.startswith("'") and right_raw.endswith("'")):
+        right = right_raw[1:-1]
+        right_is_var = False
+    else:
+        right = right_raw
+        right_is_var = right in variables
+    return left, op, right, right_is_var
+
 def handle_if(line):
     try:
-        # Prefer quoted RHS: If[VAR]="value" or If[VAR]='value'
-        match = re.match(r"If\[(.*?)\]\s*=\s*[\"'](.*)[\"']\s*$", line)
-        if match:
-            left = match.group(1).strip()
-            right = match.group(2)
-        else:
-            # Backwards-compatible: accept unquoted RHS like If[VAR]=value (warn)
-            match2 = re.match(r"If\[(.*?)\]\s*=\s*(\S+)\s*$", line)
-            if not match2:
-                print(f"[ERROR] Invalid If condition: '{line}'. Expected format: If[VAR]=\"value\"")
-                return False
-            left = match2.group(1).strip()
-            right = match2.group(2)
-            print(f"[WARN] If RHS not quoted: treating '{right}' as string")
-
+        parsed = parse_if_parts(line)
+        if not parsed:
+            print(f"[ERROR] Invalid If condition: '{line}'. Expected format: If[VAR] OP VALUE")
+            return False
+        left, op, right, right_is_var = parsed
         left_val = variables.get(left, "").strip()
-        return left_val == right
+        right_val = variables.get(right, "").strip() if right_is_var else right
+
+        if op == "=":
+            return left_val == right_val
+        if op == "<":
+            return parse_uint_like_vm(left_val) < parse_uint_like_vm(right_val)
+        if op == "<=":
+            return parse_uint_like_vm(left_val) <= parse_uint_like_vm(right_val)
+        if op == ">":
+            return parse_uint_like_vm(left_val) > parse_uint_like_vm(right_val)
+        if op == ">=":
+            return parse_uint_like_vm(left_val) >= parse_uint_like_vm(right_val)
+        print(f"[ERROR] Unsupported If operator: '{op}'")
+        return False
 
     except Exception as e:
         print(f"[ERROR] Failed to parse If condition: {e}")
@@ -414,7 +844,7 @@ def skip_if_block(start_index):
     i = start_index + 1
     while i < len(program_lines):
         l = program_lines[i].strip()
-        if l.startswith("If[") and "=" in l:
+        if IF_OP_RE.match(l):
             depth += 1
         elif l == "EndIf":
             if depth == 0:
@@ -431,7 +861,7 @@ def skip_to_endif(start_index):
     i = start_index + 1
     while i < len(program_lines):
         l = program_lines[i].strip()
-        if l.startswith("If[") and "=" in l:
+        if IF_OP_RE.match(l):
             depth += 1
         elif l == "EndIf":
             if depth == 0:
@@ -486,8 +916,19 @@ def execute_line(line):
     if line.startswith("Set["):
         handle_set(line)
 
+    elif line.startswith("DisplayTextRaw(DIRECT)=") or line.startswith("DisplayTextRaw(SHELL)="):
+        handle_display_raw(line)
+
     elif line.startswith("DisplayText(DIRECT)=") or line.startswith("DisplayText(SHELL)="):
         handle_display(line)
+
+    elif line.startswith("FS["):
+        if handle_fs_command(line):
+            return
+
+    elif line.startswith("Block["):
+        if handle_block_command(line):
+            return
 
     elif line.startswith("WriteFile"):
         match = re.match(r"WriteFile(?:\[(.*?)\])?\s*(?:=\s*(.*))?$", line)
@@ -530,7 +971,7 @@ def execute_line(line):
         else:
             handle_input()
 
-    elif line.startswith("If[") and "=" in line:
+    elif IF_OP_RE.match(line):
         if not handle_if(line):
             current_line = skip_if_block(current_line)
             if current_line < len(program_lines):
@@ -580,6 +1021,41 @@ def execute_line(line):
     elif line == "ClearScreen":
         clear_screen()
 
+    elif line == "FillLine":
+        try:
+            import shutil
+            cols = shutil.get_terminal_size((80, 20)).columns
+        except Exception:
+            cols = 80
+        text = " " * max(1, cols)
+        print(f"{ansi_prefix()}{text}{ansi_reset()}", end="")
+        print("\r", end="")
+
+    elif line.startswith("FillLines[") and line.endswith("]"):
+        try:
+            raw_count = line.split("FillLines[", 1)[1][:-1]
+            count = int(parse_token_value(raw_count))
+        except Exception:
+            print(f"[ERROR] Invalid FillLines syntax: {line}")
+            return
+        if count <= 0:
+            return
+        try:
+            import shutil
+            cols = shutil.get_terminal_size((80, 20)).columns
+        except Exception:
+            cols = 80
+        text = " " * max(1, cols)
+        prefix = ansi_prefix()
+        for i in range(count):
+            if prefix:
+                print(f"{prefix}{text}{ansi_reset()}", end="")
+            else:
+                print(text, end="")
+            if i < count - 1:
+                print()
+        print("\r", end="")
+
     elif line.startswith("SetCursor["):
         match = re.match(r"SetCursor\[(.*?)\s*,\s*(.*?)\]\s*$", line)
         if not match:
@@ -599,6 +1075,20 @@ def execute_line(line):
             return
         ms = parse_token_value(match.group(1))
         tick_timer(ms)
+
+    elif line.startswith("Time["):
+        match = re.match(r"Time\[(MS|SEC|MIN)\]\s*=\s*(.*)$", line, re.IGNORECASE)
+        if not match:
+            print(f"[ERROR] Invalid Time syntax: {line}")
+            return
+        unit = match.group(1).upper()
+        value = parse_token_value(match.group(2))
+        if unit == "MS":
+            tick_timer(value)
+        elif unit == "SEC":
+            tick_timer_seconds(value)
+        elif unit == "MIN":
+            tick_timer_minutes(value)
 
     elif line.startswith("StartFunction[") or line == "EndFunction":
         return  # Already handled in preload
@@ -775,307 +1265,582 @@ def compiler_eval_math(expr, compiler_vars):
     return _eval(tree)
 
 
-def extract_top_level_display_direct(lines):
-    """Return list of strings to print (in order) based on top-level statements.
-    Supports compile-time Set/If evaluation for DisplayText(DIRECT/SHELL).
-    Enforces quoted DisplayText values; raises on unquoted occurrences to align with interpreter.
-    """
-    out = []
+def parse_long_source(file_path):
+    with open(file_path, "r", encoding="utf-8") as f:
+        raw_lines = f.readlines()
+
     in_function = False
-    compiler_vars = {}
-    condition_stack = []
+    current_func = ""
+    functions_map = {}
+    main_lines = []
 
-    def is_active():
-        return all(condition_stack) if condition_stack else True
-
-    for raw in lines:
-        line = strip_inline_comment(raw.strip())
-        if not line or line.startswith("//"):
+    for raw in raw_lines:
+        stripped = strip_inline_comment(raw.strip())
+        if not stripped or stripped.startswith("//"):
             continue
-        # track function blocks and skip their contents
-        if line.startswith("StartFunction["):
+        if stripped.startswith("StartFunction["):
             in_function = True
+            current_func = stripped.split("StartFunction[", 1)[1].split("]", 1)[0]
+            functions_map[current_func] = []
             continue
-        if line == "EndFunction":
+        if stripped == "EndFunction":
             in_function = False
+            current_func = ""
             continue
         if in_function:
-            continue
-
-        if line.startswith("If[") and "=" in line:
-            match = re.match(r"If\[(.*?)\]\s*=\s*[\"'](.*)[\"']\s*$", line)
-            if match:
-                left = match.group(1).strip()
-                right = match.group(2)
-            else:
-                match2 = re.match(r"If\[(.*?)\]\s*=\s*(\S+)\s*$", line)
-                if not match2:
-                    raise ValueError(f"Invalid If condition: '{line}'. Expected format: If[VAR]=\"value\"")
-                left = match2.group(1).strip()
-                right = match2.group(2)
-            left_val = compiler_vars.get(left, "").strip()
-            condition_stack.append(left_val == right)
-            continue
-
-        if line == "Else":
-            if not condition_stack:
-                raise ValueError("Else without matching If")
-            condition_stack[-1] = not condition_stack[-1]
-            continue
-
-        if line == "EndIf":
-            if not condition_stack:
-                raise ValueError("EndIf without matching If")
-            condition_stack.pop()
-            continue
-
-        if not is_active():
-            continue
-
-        if line.startswith("Set["):
-            match = re.match(r"Set\[(.*?)\]\s*=\s*(.*)", line)
-            if not match:
-                raise ValueError(f"Invalid Set syntax: {line}")
-            var_name = match.group(1)
-            raw_value = match.group(2).strip()
-            if raw_value.startswith("Math(") and raw_value.endswith(")"):
-                expr = raw_value[5:-1]
-                compiler_vars[var_name] = str(compiler_eval_math(expr, compiler_vars))
-                continue
-            if raw_value.startswith("ReadFile[") and raw_value.endswith("]"):
-                path_token = raw_value[len("ReadFile["):-1]
-                file_path = compiler_parse_token_value(path_token, compiler_vars)
-                with open(file_path, "r", encoding="utf-8") as f:
-                    compiler_vars[var_name] = f.read()
-                continue
-            if raw_value.startswith('"') and raw_value.endswith('"'):
-                compiler_vars[var_name] = compiler_substitute_variables(raw_value.strip('"'), compiler_vars)
-            else:
-                compiler_vars[var_name] = compiler_parse_token_value(raw_value, compiler_vars)
-            continue
-
-        # match DisplayText(DIRECT/SHELL)="..." (require quotes)
-        m = re.match(r"DisplayText\(\s*(DIRECT|SHELL)\s*\)\s*=\s*([\"'])(.*)\2\s*$", line, flags=re.IGNORECASE)
-        if m:
-            val = compiler_substitute_variables(m.group(3), compiler_vars)
-            out.append(val)
+            functions_map[current_func].append(stripped)
         else:
-            if re.match(r"DisplayText\(\s*(DIRECT|SHELL)\s*\)\s*=\s*\S", line, flags=re.IGNORECASE):
-                raise ValueError(f"DisplayText must be quoted: {line}")
-    if condition_stack:
-        raise ValueError("Unclosed If block at end of file")
-    return out
+            main_lines.append(stripped)
+    return main_lines, functions_map
 
 
-def generate_boot_with_input_asm(strings, asm_path):
-    """Write a NASM boot sector that prints the provided strings (DIRECT) then implements
-    a simple line-editor and command dispatcher (systemstat, help, quit).
-    """
-    # Escape double quotes in strings for NASM literal
-    safe_lines = [s.replace('"', '\\"') for s in strings]
+def compile_long_to_vm(lines, functions_map):
+    ops = []
+    label_positions = {}
+    strings = {}
+    string_order = []
+    variables_map = {}
+    if_stack = []
+    loop_stack = []
+    if_counter = 0
+    loop_counter = 0
 
-    asm_lines = [
-        "bits 16",
-        "org 0x7C00",
-        "",
-        "start:",
-        "    xor ax, ax",
-        "    mov ds, ax",
-        "    mov es, ax",
-        "    mov ss, ax",
-        "    mov sp, 0x7C00",
-        "",
-        "    ; Print each top-level DIRECT string using BIOS teletype (int 0x10 AH=0x0E)",
-    ]
+    def add_string(text):
+        if text in strings:
+            return strings[text]
+        label = f"str_{len(strings)}"
+        strings[text] = label
+        string_order.append(text)
+        return label
 
-    for idx, s in enumerate(safe_lines):
-        lbl = f"msg_{idx}"
-        asm_lines += [
-            f"    mov si, {lbl}",
-            f"print_{lbl}:",
-            "    lodsb",
-            "    cmp al, 0",
-            f"    je done_{lbl}",
-            "    mov ah, 0x0E",
-            "    int 0x10",
-            f"    jmp print_{lbl}",
-            f"done_{lbl}:",
-            "    mov al, 0x0D",
-            "    mov ah, 0x0E",
-            "    int 0x10",
-            "    mov al, 0x0A",
-            "    mov ah, 0x0E",
-            "    int 0x10",
-            ""
-        ]
+    def add_var(name):
+        if name not in variables_map:
+            variables_map[name] = len(variables_map)
+        return variables_map[name]
 
-    # Prompt label and main loop
-    asm_lines += [
-        "    ; Simple prompt and command loop",
-        "main_loop:",
-        "    mov si, prompt",
-        "    call print_string",
-        "    call read_line    ; reads into 'inbuf' and returns with SI pointing to it",
-        "",
-        "    ; Compare input against supported commands",
-        "    mov si, inbuf",
-        "    mov di, cmd_systemstat",
-        "    call strcmp",
-        "    cmp al, 1",
-        "    je do_systemstat",
-        "",
-        "    mov si, inbuf",
-        "    mov di, cmd_help",
-        "    call strcmp",
-        "    cmp al, 1",
-        "    je do_help",
-        "",
-        "    mov si, inbuf",
-        "    mov di, cmd_quit",
-        "    call strcmp",
-        "    cmp al, 1",
-        "    je do_quit",
-        "",
-        "    ; Unknown command",
-        "    mov si, unknown_msg",
-        "    call print_string",
-        "    jmp main_loop",
-        "",
-        "do_systemstat:",
-        "    mov si, systemstat_msg",
-        "    call print_string",
-        "    jmp main_loop",
-        "",
-        "do_help:",
-        "    mov si, help_msg",
-        "    call print_string",
-        "    jmp main_loop",
-        "",
-        "do_quit:",
-        "    mov si, quit_msg",
-        "    call print_string",
-        "    cli",
-        "    hlt",
-        "",
-    ]
+    def emit(op):
+        ops.append(op)
 
-    # read_line: fills inbuf, returns with SI pointing to inbuf (for convenience)
-    asm_lines += [
-        "; ---------------- read_line ----------------",
-        "; Returns with SI=inbuf (pointer to start of buffer)",
-        "read_line:",
-        "    mov di, inbuf",
-        "    mov bx, di    ; save start in BX for backspace checks",
-        "read_char_loop:",
-        "    mov ah, 0x00",
-        "    int 0x16       ; wait for key, ASCII in AL",
-        "    cmp al, 0x0D   ; Enter?",
-        "    je read_done",
-        "    cmp al, 0x08   ; Backspace?",
-        "    je do_backspace",
-        "    ; Echo character",
-        "    mov ah, 0x0E",
-        "    int 0x10",
-        "    stosb           ; store char into [di] and inc di",
-        "    jmp read_char_loop",
-        "",
-        "do_backspace:",
-        "    cmp di, bx",
-        "    je read_char_loop    ; nothing to delete",
-        "    dec di",
-        "    ; Erase on screen: backspace, space, backspace",
-        "    mov al, 0x08",
-        "    mov ah, 0x0E",
-        "    int 0x10",
-        "    mov al, 0x20",
-        "    mov ah, 0x0E",
-        "    int 0x10",
-        "    mov al, 0x08",
-        "    mov ah, 0x0E",
-        "    int 0x10",
-        "    jmp read_char_loop",
-        "",
-        "read_done:",
-        "    mov byte [di], 0x00    ; null-terminate",
-        "    ; print CR LF",
-        "    mov al, 0x0D",
-        "    mov ah, 0x0E",
-        "    int 0x10",
-        "    mov al, 0x0A",
-        "    mov ah, 0x0E",
-        "    int 0x10",
-        "    mov si, inbuf",
-        "    ret",
-        "",
-    ]
+    def add_label(name):
+        label_positions[name] = len(ops)
 
-    # strcmp: compares strings at SI and DI, returns AL=1 if equal else AL=0
-    asm_lines += [
-        "; ---------------- strcmp ----------------",
-        "; Inputs: SI->str1, DI->str2. Returns AL=1 if equal, AL=0 otherwise",
-        "strcmp:",
-        "    .cmp_loop:",
-        "    mov al, [si]",
-        "    mov bl, [di]",
-        "    cmp al, bl",
-        "    jne .not_equal",
-        "    cmp al, 0",
-        "    je .equal",
-        "    inc si",
-        "    inc di",
-        "    jmp .cmp_loop",
-        "    .not_equal:",
-        "    mov al, 0",
-        "    ret",
-        "    .equal:",
-        "    mov al, 1",
-        "    ret",
-        "",
-    ]
+    def parse_display_text(raw_line, raw=False):
+        if raw:
+            pattern = r"DisplayTextRaw\((.*?)\)\s*=\s*([\"'])(.*)\2\s*$"
+        else:
+            pattern = r"DisplayText\((.*?)\)\s*=\s*([\"'])(.*)\2\s*$"
+        match = re.match(pattern, raw_line)
+        if not match:
+            name = "DisplayTextRaw" if raw else "DisplayText"
+            raise ValueError(f"Invalid {name} syntax (must be quoted): {raw_line}")
+        tag = match.group(1).strip().upper()
+        content = match.group(3).strip()
+        return tag, content
 
-    # print_string: SI->zero-terminated string
-    asm_lines += [
-        "; ---------------- print_string ----------------",
-        "print_string:",
-        "    .print_loop:",
-        "    lodsb",
-        "    cmp al, 0",
-        "    je .ret_ps",
-        "    mov ah, 0x0E",
-        "    int 0x10",
-        "    jmp .print_loop",
-        "    .ret_ps:",
-        "    ret",
-        "",
-    ]
+    def split_template(text):
+        parts = []
+        idx = 0
+        while idx < len(text):
+            start = text.find("<`", idx)
+            if start == -1:
+                if idx < len(text):
+                    parts.append(("text", text[idx:]))
+                break
+            if start > idx:
+                parts.append(("text", text[idx:start]))
+            end = text.find("`>", start + 2)
+            if end == -1:
+                parts.append(("text", text[start:]))
+                break
+            var_name = text[start + 2:end]
+            parts.append(("var", var_name))
+            idx = end + 2
+        return parts
 
-    # Data: inbuf and command strings and canned responses
-    asm_lines += [
-        "; ---------------- data ----------------",
-        "inbuf: times 80 db 0",
-        "prompt db '>', 0",
-        "cmd_systemstat db 'systemstat',0",
-        "cmd_help db 'help',0",
-        "cmd_quit db 'quit',0",
-        "unknown_msg db 'Unknown command',0",
-        "systemstat_msg db 'System Status: OK',0",
-        "help_msg db 'Available commands: systemstat, help, quit',0",
-        "quit_msg db 'Goodbye! Halting...',0",
-    ]
+    def emit_display_with_subs(content, add_newline=True):
+        parts = split_template(content)
+        for kind, value in parts:
+            if kind == "text":
+                if value:
+                    label = add_string(value)
+                    emit(("PRINT_STR", label))
+            else:
+                add_var(value)
+                emit(("PRINT_VAR", value))
+        if add_newline:
+            emit(("NL",))
 
-    # Preserve any top-level messages as well (append original messages as data labels)
-    for idx, s in enumerate(safe_lines):
-        lbl = f"msg_{idx}"
-        asm_lines.append(f"{lbl} db \"{s}\", 0")
+    def parse_math_expr(expr):
+        # Supported: Math(<`VAR`>+N), Math(<`VAR`>-N), Math(<`VAR`>+<`VAR`>), Math(<`VAR`>-<`VAR`>)
+        m = re.match(r"Math\(\s*<`(.*?)`>\s*([+\-])\s*(<`(.*?)`>|\d+)\s*\)\s*$", expr)
+        if not m:
+            return None
+        left = m.group(1).strip()
+        op = m.group(2)
+        right_raw = m.group(3)
+        if right_raw.startswith("<`") and right_raw.endswith("`>"):
+            right = right_raw[2:-2].strip()
+            return ("VV", left, op, right)
+        return ("VI", left, op, int(right_raw))
 
-    asm_lines += [
-        "",
-        "times 510 - ($ - $$) db 0",
-        "dw 0xAA55",
-    ]
+    def compile_lines(line_list):
+        nonlocal if_stack, if_counter, loop_counter
+        for line in line_list:
+            line = strip_inline_comment(line.strip())
+            if not line or line.startswith("//"):
+                continue
 
-    with open(asm_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(asm_lines))
+            if line.replace(" ", "") in ("[16BIT]", "startprogram", "endprogram", "startsection", "endsection"):
+                continue
+
+            if line.startswith("Label[") and "]" in line:
+                label_name = line.split("Label[", 1)[1].split("]", 1)[0].strip()
+                add_label(f"LBL_{label_name}")
+                continue
+            if line.startswith("Label:"):
+                label_name = line[6:].strip()
+                print(f"[WARN] Deprecated label syntax 'Label:NAME' used for '{label_name}'; prefer 'Label[{label_name}]'")
+                add_label(f"LBL_{label_name}")
+                continue
+
+            if line.startswith("DisplayTextRaw("):
+                tag, content = parse_display_text(line, raw=True)
+                emit_display_with_subs(content, add_newline=False)
+                continue
+
+            if line.startswith("DisplayText("):
+                tag, content = parse_display_text(line, raw=False)
+                emit_display_with_subs(content, add_newline=True)
+                continue
+
+            if line.startswith("SetColor["):
+                match = re.match(r"SetColor\[(FG|BG)\]\s*=\s*(.*)$", line, re.IGNORECASE)
+                if not match:
+                    raise ValueError(f"Invalid SetColor syntax: {line}")
+                which = match.group(1).strip().upper()
+                value = match.group(2).strip().strip('"').strip("'")
+                color_map = {
+                    "BLACK": 0,
+                    "BLUE": 1,
+                    "GREEN": 2,
+                    "CYAN": 3,
+                    "RED": 4,
+                    "MAGENTA": 5,
+                    "BROWN": 6,
+                    "LIGHTGRAY": 7,
+                    "DARKGRAY": 8,
+                    "LIGHTBLUE": 9,
+                    "LIGHTGREEN": 10,
+                    "LIGHTCYAN": 11,
+                    "LIGHTRED": 12,
+                    "LIGHTMAGENTA": 13,
+                    "YELLOW": 14,
+                    "WHITE": 15,
+                    "BRIGHTBLACK": 8,
+                    "BRIGHTBLUE": 9,
+                    "BRIGHTGREEN": 10,
+                    "BRIGHTCYAN": 11,
+                    "BRIGHTRED": 12,
+                    "BRIGHTMAGENTA": 13,
+                    "BRIGHTYELLOW": 14,
+                    "BRIGHTWHITE": 15,
+                }
+                key = value.strip().upper()
+                if key not in color_map:
+                    raise ValueError(f"Unknown color '{value}' in {line}")
+                emit(("SET_COLOR", which, color_map[key]))
+                continue
+            if line == "ResetColor":
+                emit(("RESET_COLOR",))
+                continue
+
+            if line == "ClearScreen":
+                emit(("CLEAR",))
+                continue
+
+            if line.strip().upper() == "HALT":
+                emit(("HALT",))
+                continue
+
+            if line == "FillLine":
+                emit(("FILL_LINE",))
+                continue
+
+            if line.startswith("FillLines[") and line.endswith("]"):
+                raw_count = line.split("FillLines[", 1)[1][:-1]
+                count = compiler_parse_token_value(raw_count, {})
+                if not count.isdigit():
+                    raise ValueError(f"FillLines requires a numeric count: {line}")
+                emit(("FILL_LINES", int(count)))
+                continue
+
+            if line.startswith("SetCursor["):
+                match = re.match(r"SetCursor\[(.*?)\s*,\s*(.*?)\]\s*$", line)
+                if not match:
+                    raise ValueError(f"Invalid SetCursor syntax: {line}")
+                raw_row = match.group(1).strip()
+                raw_col = match.group(2).strip()
+
+                def parse_immediate(token):
+                    if token.startswith('"') and token.endswith('"'):
+                        token = token[1:-1]
+                    return int(token) if re.fullmatch(r"\d+", token or "") else None
+
+                row_imm = parse_immediate(raw_row)
+                col_imm = parse_immediate(raw_col)
+                if row_imm is not None and col_imm is not None:
+                    if row_imm > 255 or col_imm > 255:
+                        raise ValueError("SetCursor immediate values must be <= 255")
+                    emit(("SET_CURSOR_II", row_imm, col_imm))
+                else:
+                    add_var(raw_row)
+                    add_var(raw_col)
+                    emit(("SET_CURSOR_VV", raw_row, raw_col))
+                continue
+
+            if line.startswith("DrawBox["):
+                match = re.match(r"DrawBox\[(\d+)\s*,\s*(\d+)\]\s*=\s*(.*)$", line)
+                if not match:
+                    raise ValueError(f"Invalid DrawBox syntax: {line}")
+                width = int(match.group(1))
+                height = int(match.group(2))
+                raw_ch = match.group(3).strip()
+                ch_value = compiler_parse_token_value(raw_ch, {})
+                if not ch_value:
+                    ch_value = "#"
+                emit(("DRAW_BOX", width, height, ch_value[0]))
+                continue
+
+            if line.startswith("TrackInput[KEYBOARD]"):
+                add_var("INPUT")
+                emit(("INPUT", "INPUT"))
+                continue
+
+            if line.startswith("Set["):
+                match = re.match(r"Set\[(.*?)\]\s*=\s*(.*)", line)
+                if not match:
+                    raise ValueError(f"Invalid Set syntax: {line}")
+                var_name = match.group(1).strip()
+                raw_value = match.group(2).strip()
+
+                if raw_value.startswith("Math(") and raw_value.endswith(")"):
+                    parsed = parse_math_expr(raw_value)
+                    if not parsed:
+                        raise ValueError("Math() in VM compile mode only supports: Math(<`VAR`> +/- <`VAR`|NUMBER>)")
+                    add_var(var_name)
+                    kind, left, op, right = parsed
+                    add_var(left)
+                    if kind == "VI":
+                        emit(("MATH_VI", var_name, left, op, right))
+                    else:
+                        add_var(right)
+                        emit(("MATH_VV", var_name, left, op, right))
+                    continue
+                if raw_value.startswith("ReadFile[") and raw_value.endswith("]"):
+                    raise ValueError("ReadFile[] is not supported in VM compile mode")
+
+                if raw_value.startswith("DisplayText("):
+                    tag, content = parse_display_text(raw_value)
+                    label = add_string(content)
+                    emit(("PRINT_STR", label))
+                    emit(("NL",))
+                    add_var(var_name)
+                    emit(("SET_STR", var_name, label))
+                    continue
+
+                if raw_value.startswith('"') and raw_value.endswith('"'):
+                    literal = raw_value.strip('"')
+                    if "<`" in literal:
+                        print("[WARN] Variable substitution in Set[...] strings is not supported in VM compile mode.")
+                    label = add_string(literal)
+                    add_var(var_name)
+                    emit(("SET_STR", var_name, label))
+                    continue
+
+                # Treat as variable reference
+                add_var(var_name)
+                add_var(raw_value)
+                emit(("SET_VAR", var_name, raw_value))
+                continue
+
+            if line.startswith("If["):
+                match = IF_OP_RE.match(line)
+                if not match:
+                    raise ValueError(f"Invalid If condition: '{line}'. Expected format: If[VAR] OP VALUE")
+                left = match.group(1).strip()
+                op = match.group(2)
+                right_raw = match.group(3).strip()
+                if (right_raw.startswith('"') and right_raw.endswith('"')) or (right_raw.startswith("'") and right_raw.endswith("'")):
+                    right = right_raw[1:-1]
+                    right_is_var = False
+                else:
+                    right = right_raw
+                    right_is_var = False
+                    if re.fullmatch(r"-?\d+", right):
+                        if right.startswith("-"):
+                            raise ValueError("Numeric comparisons do not support negative immediates in VM mode")
+                    else:
+                        right_is_var = True
+
+                add_var(left)
+                if_counter += 1
+                if_id = if_counter
+                false_label = f"IF_FALSE_{if_id}"
+                end_label = f"IF_END_{if_id}"
+
+                if op == "=":
+                    label = add_string(right)
+                    emit(("IF_NE_STR", left, label, false_label))
+                elif op in ("<", "<=", ">", ">="):
+                    op_code = {"<": 0, "<=": 1, ">": 2, ">=": 3}[op]
+                    if right_is_var:
+                        add_var(right)
+                        emit(("IF_NUM_VV", left, op_code, right, false_label))
+                    else:
+                        if not re.fullmatch(r"\d+", right):
+                            raise ValueError("Numeric comparisons require a numeric literal or variable")
+                        emit(("IF_NUM_VI", left, op_code, int(right), false_label))
+                else:
+                    raise ValueError(f"Unsupported If operator: '{op}'")
+
+                if_stack.append({"false_label": false_label, "end_label": end_label, "has_else": False})
+                continue
+
+            if line == "Else":
+                if not if_stack:
+                    raise ValueError("Else without matching If")
+                entry = if_stack[-1]
+                emit(("GOTO", entry["end_label"]))
+                add_label(entry["false_label"])
+                entry["has_else"] = True
+                continue
+
+            if line == "EndIf":
+                if not if_stack:
+                    raise ValueError("EndIf without matching If")
+                entry = if_stack.pop()
+                if entry["has_else"]:
+                    add_label(entry["end_label"])
+                else:
+                    add_label(entry["false_label"])
+                continue
+
+            if line.startswith("Loop[FOREVER]"):
+                loop_counter += 1
+                loop_id = loop_counter
+                loop_label = f"LOOP_{loop_id}"
+                add_label(loop_label)
+                loop_stack.append(loop_label)
+                continue
+
+            if line == "EndLoop":
+                if not loop_stack:
+                    raise ValueError("EndLoop without matching Loop")
+                loop_label = loop_stack.pop()
+                emit(("GOTO", loop_label))
+                continue
+
+            if line.startswith("Goto["):
+                label = line.split("Goto[", 1)[1].split("]", 1)[0]
+                emit(("GOTO", f"LBL_{label}"))
+                continue
+
+            if line.startswith("CallFunction["):
+                match = re.match(r"CallFunction\[(.*?)\]\s*(?:->\s*(\S+)\s*)?$", line)
+                if not match:
+                    raise ValueError(f"Invalid CallFunction syntax: {line}")
+                func = match.group(1).strip()
+                target = match.group(2)
+                if target:
+                    # Clear return register to avoid stale values.
+                    ret_label = add_string("")
+                    add_var("__RETVAL")
+                    emit(("SET_STR", "__RETVAL", ret_label))
+                emit(("CALL", f"FUNC_{func}"))
+                if target:
+                    add_var(target)
+                    add_var("__RETVAL")
+                    emit(("SET_VAR", target, "__RETVAL"))
+                continue
+
+            if line.startswith("Return[") and line.endswith("]"):
+                raw_value = line.split("Return[", 1)[1][:-1].strip()
+                add_var("__RETVAL")
+                if not raw_value:
+                    label = add_string("")
+                    emit(("SET_STR", "__RETVAL", label))
+                    emit(("RET",))
+                    continue
+                if (raw_value.startswith('"') and raw_value.endswith('"')) or (
+                    raw_value.startswith("'") and raw_value.endswith("'")
+                ):
+                    literal = raw_value[1:-1]
+                    label = add_string(literal)
+                    emit(("SET_STR", "__RETVAL", label))
+                    emit(("RET",))
+                    continue
+                # Treat as variable reference
+                add_var(raw_value)
+                emit(("SET_VAR", "__RETVAL", raw_value))
+                emit(("RET",))
+                continue
+
+            raise ValueError(f"Unsupported command in VM compile mode: {line}")
+
+    compile_lines(lines)
+
+    for func_name, func_lines in functions_map.items():
+        add_label(f"FUNC_{func_name}")
+        compile_lines(func_lines)
+        emit(("RET",))
+
+    return ops, label_positions, variables_map, strings, string_order
+
+
+def build_vm_program_asm(ops, label_positions, variables_map, strings, string_order):
+    labels_by_index = {}
+    for name, idx in label_positions.items():
+        labels_by_index.setdefault(idx, []).append(name)
+
+    lines = []
+    lines.append("; -------------- Bytecode --------------")
+    lines.append("program:")
+
+    for idx, op in enumerate(ops):
+        for label in labels_by_index.get(idx, []):
+            lines.append(f"{label}:")
+        lines.append(f"L{idx}:")
+        opcode = op[0]
+        if opcode == "PRINT_STR":
+            lines.append("    db 0x01")
+            lines.append(f"    dw {op[1]}")
+        elif opcode == "HALT":
+            lines.append("    db 0x00")
+        elif opcode == "PRINT_VAR":
+            lines.append("    db 0x02")
+            lines.append(f"    db {variables_map[op[1]]}")
+        elif opcode == "SET_STR":
+            lines.append("    db 0x03")
+            lines.append(f"    db {variables_map[op[1]]}")
+            lines.append(f"    dw {op[2]}")
+        elif opcode == "SET_VAR":
+            lines.append("    db 0x04")
+            lines.append(f"    db {variables_map[op[1]]}")
+            lines.append(f"    db {variables_map[op[2]]}")
+        elif opcode == "INPUT":
+            lines.append("    db 0x05")
+            lines.append(f"    db {variables_map[op[1]]}")
+        elif opcode == "IF_NE_STR":
+            lines.append("    db 0x06")
+            lines.append(f"    db {variables_map[op[1]]}")
+            lines.append(f"    dw {op[2]}")
+            lines.append(f"    dw {op[3]}")
+        elif opcode == "IF_NUM_VI":
+            lines.append("    db 0x17")
+            lines.append(f"    db {variables_map[op[1]]}")
+            lines.append(f"    db {op[2]}")
+            lines.append(f"    dw {op[3]}")
+            lines.append(f"    dw {op[4]}")
+        elif opcode == "IF_NUM_VV":
+            lines.append("    db 0x18")
+            lines.append(f"    db {variables_map[op[1]]}")
+            lines.append(f"    db {op[2]}")
+            lines.append(f"    db {variables_map[op[3]]}")
+            lines.append(f"    dw {op[4]}")
+        elif opcode == "GOTO":
+            lines.append("    db 0x07")
+            lines.append(f"    dw {op[1]}")
+        elif opcode == "CALL":
+            lines.append("    db 0x08")
+            lines.append(f"    dw {op[1]}")
+        elif opcode == "RET":
+            lines.append("    db 0x09")
+        elif opcode == "NL":
+            lines.append("    db 0x0B")
+        elif opcode == "SET_COLOR":
+            lines.append("    db 0x0C")
+            lines.append("    db 0" if op[1] == "FG" else "    db 1")
+            lines.append(f"    db {op[2]}")
+        elif opcode == "RESET_COLOR":
+            lines.append("    db 0x15")
+        elif opcode == "CLEAR":
+            lines.append("    db 0x0D")
+        elif opcode == "NO_NL":
+            lines.append("    db 0x0E")
+        elif opcode == "FILL_LINE":
+            lines.append("    db 0x14")
+        elif opcode == "FILL_LINES":
+            lines.append("    db 0x16")
+            lines.append(f"    db {op[1]}")
+        elif opcode == "DRAW_BOX":
+            lines.append("    db 0x0F")
+            lines.append(f"    db {op[1]}")
+            lines.append(f"    db {op[2]}")
+            lines.append(f"    db {ord(op[3])}")
+        elif opcode == "SET_CURSOR_VV":
+            lines.append("    db 0x12")
+            lines.append(f"    db {variables_map[op[1]]}")
+            lines.append(f"    db {variables_map[op[2]]}")
+        elif opcode == "SET_CURSOR_II":
+            lines.append("    db 0x13")
+            lines.append(f"    db {op[1]}")
+            lines.append(f"    db {op[2]}")
+        elif opcode == "MATH_VI":
+            lines.append("    db 0x10")
+            lines.append(f"    db {variables_map[op[1]]}")
+            lines.append(f"    db {variables_map[op[2]]}")
+            lines.append(f"    db {ord(op[3])}")
+            lines.append(f"    dw {op[4]}")
+        elif opcode == "MATH_VV":
+            lines.append("    db 0x11")
+            lines.append(f"    db {variables_map[op[1]]}")
+            lines.append(f"    db {variables_map[op[2]]}")
+            lines.append(f"    db {ord(op[3])}")
+            lines.append(f"    db {variables_map[op[4]]}")
+        else:
+            raise ValueError(f"Unknown opcode: {opcode}")
+
+    if labels_by_index.get(len(ops)):
+        for label in labels_by_index[len(ops)]:
+            lines.append(f"{label}:")
+
+    lines.append("program_end:")
+    lines.append("    db 0x0A")
+
+    lines.append("")
+    lines.append("; -------------- Data --------------")
+    lines.append("inbuf: times 80 db 0")
+    lines.append("call_sp db 0")
+    lines.append("call_stack: times 16 dw 0")
+
+    var_count = max(1, len(variables_map))
+    for i in range(var_count):
+        lines.append(f"var_{i}: times 64 db 0")
+    lines.append("var_table:")
+    for i in range(var_count):
+        lines.append(f"    dw var_{i}")
+    lines.append("current_attr db 0x07")
+    lines.append("cursor_pos dw 0")
+    lines.append("tmpbuf: times 16 db 0")
+    lines.append("tmpbuf_rev: times 16 db 0")
+
+    for text in string_order:
+        label = strings[text]
+        safe = text.replace("\\", "\\\\").replace('"', '\\"')
+        if "\n" in safe:
+            safe = safe.replace("\\n", "\" , 0x0D, 0x0A, \"")
+        lines.append(f"{label} db \"{safe}\", 0")
+
+    return "\n".join(lines)
+
+
+def replace_section(text, start_marker, end_marker, new_section):
+    start_idx = text.find(start_marker)
+    end_idx = text.find(end_marker)
+    if start_idx == -1 or end_idx == -1 or end_idx < start_idx:
+        raise ValueError(f"Template markers not found: {start_marker} / {end_marker}")
+    start_idx += len(start_marker)
+    return text[:start_idx] + "\n" + new_section + "\n" + text[end_idx:]
 
 
 def compile_to_boot_sector(source_file, output_file):
@@ -1083,37 +1848,90 @@ def compile_to_boot_sector(source_file, output_file):
         print(f"Source file not found: {source_file}")
         sys.exit(1)
 
-    with open(source_file, "r", encoding="utf-8") as f:
-        lines = f.readlines()
+    repo_root = get_repo_root()
+    build_dir = os.path.join(repo_root, "build")
+    ensure_dir(build_dir)
 
-    strings = extract_top_level_display_direct(lines)
-
-    if not strings:
-        print("No top-level DisplayText(DIRECT)=... entries found to compile.")
-        print("(This compiler only emits DIRECT output into an early boot sector for now.)")
-        sys.exit(0)
-
-    # If the caller asked for a .bin output, emit a small NASM asm that prints the strings
-    # then echoes keyboard input, assemble it with nasm, and write the binary.
-    asm_path = os.path.splitext(output_file)[0] + ".asm"
+    main_lines, functions_map = parse_long_source(source_file)
     try:
-        generate_boot_with_input_asm(strings, asm_path)
-    except Exception as e:
-        print(f"[ERROR] Failed to generate asm: {e}")
+        ops, label_positions, variables_map, strings, string_order = compile_long_to_vm(main_lines, functions_map)
+    except ValueError as e:
+        print(f"[ERROR] {e}")
         sys.exit(1)
 
-    # Assemble with nasm if available
+    program_asm = build_vm_program_asm(ops, label_positions, variables_map, strings, string_order)
+
+    stage2_template = os.path.join(repo_root, "boot", "boot_stage2.asm")
+    with open(stage2_template, "r", encoding="utf-8") as f:
+        template_text = f.read()
+
+    try:
+        template_text = replace_section(
+            template_text,
+            "; === LONGC_PROGRAM_START",
+            "; === LONGC_PROGRAM_END",
+            program_asm,
+        )
+    except ValueError as e:
+        print(f"[ERROR] {e}")
+        sys.exit(1)
+
+    stage2_asm_path = os.path.join(build_dir, "boot_stage2.asm")
+    with open(stage2_asm_path, "w", encoding="utf-8") as f:
+        f.write(template_text)
+
     try:
         import subprocess
-        res = subprocess.run(["nasm", "-f", "bin", asm_path, "-o", output_file], check=False)
+        stage2_bin_path = os.path.join(build_dir, "boot_stage2.bin")
+        res = subprocess.run(["nasm", "-f", "bin", stage2_asm_path, "-o", stage2_bin_path], check=False)
         if res.returncode != 0:
-            print("[ERROR] nasm failed to assemble the boot asm. Ensure nasm is installed and on PATH.")
+            print("[ERROR] nasm failed to assemble boot_stage2.asm. Ensure nasm is installed and on PATH.")
             sys.exit(1)
     except FileNotFoundError:
         print("[ERROR] nasm not found. Install nasm or assemble the generated .asm manually.")
         sys.exit(1)
 
-    # Report success
+    stage2_size = os.path.getsize(stage2_bin_path)
+    stage2_sectors = (stage2_size + 511) // 512
+    if stage2_sectors == 0:
+        stage2_sectors = 1
+
+    stage1_template = os.path.join(repo_root, "boot", "boot_stage1.asm")
+    with open(stage1_template, "r", encoding="utf-8") as f:
+        stage1_text = f.read()
+    stage1_text = re.sub(r"STAGE2_SECTORS\s+equ\s+\d+", f"STAGE2_SECTORS equ {stage2_sectors}", stage1_text)
+
+    stage1_asm_path = os.path.join(build_dir, "boot_stage1.asm")
+    with open(stage1_asm_path, "w", encoding="utf-8") as f:
+        f.write(stage1_text)
+
+    try:
+        import subprocess
+        stage1_bin_path = os.path.join(build_dir, "boot_stage1.bin")
+        res = subprocess.run(["nasm", "-f", "bin", stage1_asm_path, "-o", stage1_bin_path], check=False)
+        if res.returncode != 0:
+            print("[ERROR] nasm failed to assemble boot_stage1.asm. Ensure nasm is installed and on PATH.")
+            sys.exit(1)
+    except FileNotFoundError:
+        print("[ERROR] nasm not found. Install nasm or assemble the generated .asm manually.")
+        sys.exit(1)
+
+    with open(stage1_bin_path, "rb") as f:
+        stage1_bin = f.read()
+    with open(stage2_bin_path, "rb") as f:
+        stage2_bin = f.read()
+
+    padded_stage2 = stage2_bin.ljust(stage2_sectors * 512, b"\x00")
+    boot_img = stage1_bin + padded_stage2
+
+    # Pad to 1.44MB floppy so MEMDISK reports sane CHS geometry (>=2 sectors/track)
+    floppy_size = 1474560
+    if len(boot_img) < floppy_size:
+        boot_img = boot_img.ljust(floppy_size, b"\x00")
+
+    with open(output_file, "wb") as f:
+        f.write(boot_img)
+
     size = os.path.getsize(output_file)
     print(f"Wrote bootable image: {output_file} ({size} bytes)")
     print("You can boot it in QEMU: qemu-system-i386 -drive format=raw,file=%s" % output_file)
@@ -1123,13 +1941,14 @@ def compile_to_boot_sector(source_file, output_file):
 # ------------------------------
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python longc.py <program.long> [output.bin]")
+        print("Usage: python longc.py <program.long> [output.img]")
         sys.exit(1)
 
-    if len(sys.argv) == 3 and sys.argv[2].endswith(".bin"):
+    if len(sys.argv) == 3 and (sys.argv[2].endswith(".bin") or sys.argv[2].endswith(".img")):
         compile_to_boot_sector(sys.argv[1], sys.argv[2])
     elif len(sys.argv) == 2 and sys.argv[1].endswith(".long"):
-        compile_to_boot_sector(sys.argv[1], "boot.bin")
+        default_output = os.path.join(get_repo_root(), "build", "boot.img")
+        compile_to_boot_sector(sys.argv[1], default_output)
     else:
         load_program(sys.argv[1])
         run_program()
