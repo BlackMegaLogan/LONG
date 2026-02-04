@@ -1513,7 +1513,12 @@ def compile_long_to_vm(lines, functions_map):
 
             if line.startswith("TrackInput[KEYBOARD]"):
                 add_var("INPUT")
-                emit(("INPUT", "INPUT"))
+                add_var("WORD1")
+                add_var("WORD2")
+                add_var("WORD3")
+                add_var("WORDCOUNT")
+                add_var("WORDREST")
+                emit(("INPUT_WORDS", "INPUT", "WORD1", "WORD2", "WORD3", "WORDCOUNT", "WORDREST"))
                 continue
 
             if line.startswith("Set["):
@@ -1730,6 +1735,14 @@ def build_vm_program_asm(ops, label_positions, variables_map, strings, string_or
         elif opcode == "INPUT":
             lines.append("    db 0x05")
             lines.append(f"    db {variables_map[op[1]]}")
+        elif opcode == "INPUT_WORDS":
+            lines.append("    db 0x19")
+            lines.append(f"    db {variables_map[op[1]]}")
+            lines.append(f"    db {variables_map[op[2]]}")
+            lines.append(f"    db {variables_map[op[3]]}")
+            lines.append(f"    db {variables_map[op[4]]}")
+            lines.append(f"    db {variables_map[op[5]]}")
+            lines.append(f"    db {variables_map[op[6]]}")
         elif opcode == "IF_NE_STR":
             lines.append("    db 0x06")
             lines.append(f"    db {variables_map[op[1]]}")
@@ -1823,6 +1836,12 @@ def build_vm_program_asm(ops, label_positions, variables_map, strings, string_or
     lines.append("cursor_pos dw 0")
     lines.append("tmpbuf: times 16 db 0")
     lines.append("tmpbuf_rev: times 16 db 0")
+    lines.append("input_idx db 0")
+    lines.append("word1_idx db 0")
+    lines.append("word2_idx db 0")
+    lines.append("word3_idx db 0")
+    lines.append("wordcount_idx db 0")
+    lines.append("wordrest_idx db 0")
 
     for text in string_order:
         label = strings[text]
